@@ -4,14 +4,12 @@ filler/universal.py — Universal Playwright + Claude-vision form filler.
 Critical flows:
   1. Land on apply_url  →  detect if job-listing page  →  click Apply/CTA  →
      handle new-tab OR same-page navigation  →  reach actual form.
-  2. Detect login walls early (Indeed, LinkedIn, Google SSO).
-  3. For Indeed: enter email → poll Outlook IMAP for OTP → enter code.
-  4. Fill every visible field (vision-guided agent loop with Claude).
-  5. Multi-page forms: click Next/Continue between pages.
-  6. File upload (resume PDF via input[type=file]).
-  7. Free-text custom questions: Claude generates answers from profile + JD.
-  8. Shadow mode : fill everything, stop BEFORE final Submit.
-  9. Live   mode : fill everything, click Submit, confirm success page.
+  2. Fill every visible field (vision-guided agent loop with Claude).
+  3. Multi-page forms: click Next/Continue between pages.
+  4. File upload (resume PDF via input[type=file]).
+  5. Free-text custom questions: Claude generates answers from profile + JD.
+  6. Shadow mode : fill everything, stop BEFORE final Submit.
+  7. Live   mode : fill everything, click Submit, confirm success page.
 """
 
 from __future__ import annotations
@@ -138,6 +136,35 @@ class UniversalFiller:
         screenshots_dir.mkdir(parents=True, exist_ok=True)
         ats_type = detect_ats_type(apply_url)
 
+        # ── Pre-flight: reject LinkedIn Easy Apply URLs immediately ───────────
+        # LinkedIn requires an authenticated session. Without saved cookies the
+        # browser lands on linkedin.com/signup and tries to create an account.
+        # We detect this up front (before opening a browser) and skip cleanly.
+        _linkedin_apply_signals = (
+            "linkedin.com/jobs/",
+            "linkedin.com/job/",
+            "linkedin.com/comm/jobs/",
+        )
+        if any(sig in apply_url.lower() for sig in _linkedin_apply_signals):
+            log.info(
+                "filler.linkedin_url_skipped",
+                extra={
+                    "app_id": app_id,
+                    "apply_url": apply_url,
+                    "reason": "LinkedIn Easy Apply requires saved cookies. "
+                              "Run setup/linkedin_auth.py to enable LinkedIn applications.",
+                },
+            )
+            return FillResult(
+                status="skipped",
+                error=(
+                    "LinkedIn Easy Apply requires an authenticated session. "
+                    "Run `python setup/linkedin_auth.py` to save your LinkedIn cookies, "
+                    "then try again. Or find the direct company application link instead."
+                ),
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+
         log.info(
             "filler.start",
             extra={
@@ -167,6 +194,7 @@ class UniversalFiller:
         fill_log: list[dict[str, Any]] = []
         screenshots: list[str] = []
         custom_qa: dict[str, str] = {}
+        page = None
 
         try:
             context = await self._browser.new_context(  # type: ignore[union-attr]
@@ -189,33 +217,18 @@ class UniversalFiller:
             screenshots.append(shot)
             fill_log.append({"step": "navigate", "url": apply_url})
 
-            # ── Step 1b: Early login-wall check before clicking anything ──
+            # ── Step 1b: Early login-wall check (before clicking anything) ─
             early_check = await self._preflight(page)
-            if early_check["verdict"] == "indeed_login":
-                log.info("filler.indeed_login_page", extra={"app_id": app_id, "url": page.url})
-                fill_log.append({"step": "indeed_login", "url": page.url})
-                auth_ok = await self._handle_indeed_login(page, profile, fill_log)
-                if not auth_ok:
-                    return FillResult(
-                        status="needs_manual",
-                        screenshots=screenshots,
-                        fill_log=fill_log,
-                        error=(
-                            "Indeed login required. Configure OUTLOOK_EMAIL + "
-                            "OUTLOOK_APP_PASSWORD in .env so the app can fetch "
-                            "the one-time verification code automatically."
-                        ),
-                        duration_ms=int((time.monotonic() - start) * 1000),
-                    )
-                shot = await self._screenshot(page, screenshots_dir, len(screenshots))
-                screenshots.append(shot)
-
-            elif early_check["verdict"] not in ("ok", "indeed_login"):
+            if early_check["verdict"] == "login_required":
+                log.warning(
+                    "filler.login_wall_on_landing",
+                    extra={"app_id": app_id, "url": page.url},
+                )
                 return FillResult(
                     status="skipped",
                     screenshots=screenshots,
                     fill_log=fill_log,
-                    error=early_check.get("reason", "Blocked at initial URL"),
+                    error=early_check["reason"],
                     duration_ms=int((time.monotonic() - start) * 1000),
                 )
 
@@ -231,39 +244,46 @@ class UniversalFiller:
             # ── Step 3: Preflight on the form page ───────────────────────
             preflight = await self._preflight(page)
             fill_log.append({"step": "preflight", **preflight})
-
             if preflight["verdict"] == "indeed_login":
+                # Handle Indeed email + OTP authentication inline
                 log.info("filler.indeed_login_page", extra={"app_id": app_id, "url": page.url})
                 fill_log.append({"step": "indeed_login", "url": page.url})
                 auth_ok = await self._handle_indeed_login(page, profile, fill_log)
-                if not auth_ok:
+                if auth_ok:
+                    # Reload snapshot after auth
+                    shot = await self._screenshot(page, screenshots_dir, len(screenshots))
+                    screenshots.append(shot)
+                    preflight = await self._preflight(page)
+                    fill_log.append({"step": "preflight_post_auth", **preflight})
+                else:
                     return FillResult(
                         status="needs_manual",
                         screenshots=screenshots,
                         fill_log=fill_log,
                         error=(
-                            "Indeed login required but OTP not received. "
-                            "Check that OUTLOOK_EMAIL and OUTLOOK_APP_PASSWORD are set in .env."
+                            "Indeed login required. Enter your email in the browser and "
+                            "configure OUTLOOK_EMAIL + OUTLOOK_APP_PASSWORD in .env so the "
+                            "app can fetch the one-time verification code automatically."
                         ),
                         duration_ms=int((time.monotonic() - start) * 1000),
                     )
-                shot = await self._screenshot(page, screenshots_dir, len(screenshots))
-                screenshots.append(shot)
-                preflight = await self._preflight(page)
 
-            if preflight["verdict"] not in ("ok", "indeed_login"):
+            if preflight["verdict"] != "ok":
                 status_map = {
                     "closed": ("skipped", "Listing closed"),
-                    "login_required": ("skipped", preflight.get("reason", "Login required")),
-                    "unsupported": ("needs_manual", preflight.get("reason", "Unsupported page")),
+                    "login_required": ("skipped", preflight["reason"]),
+                    "unsupported": ("needs_manual", preflight["reason"]),
                 }
                 final_status, error_msg = status_map.get(
-                    preflight["verdict"],
-                    ("failed", preflight.get("reason", "Preflight failed")),
+                    preflight["verdict"], ("failed", preflight.get("reason", "Unknown preflight failure"))
                 )
                 log.warning(
                     "filler.preflight_blocked",
-                    extra={"app_id": app_id, "verdict": preflight["verdict"], "url": page.url},
+                    extra={
+                        "app_id": app_id,
+                        "verdict": preflight["verdict"],
+                        "url": page.url,
+                    },
                 )
                 return FillResult(
                     status=final_status,
@@ -296,15 +316,55 @@ class UniversalFiller:
                     job_description=job_description,
                     fill_log=fill_log,
                     submit=submit,
+                    step_number=step,
                 )
                 fill_log.append({"step": step, "summary": plan.get("summary", "")})
 
                 if plan.get("done"):
-                    log.info(
-                        "filler.agent_done",
-                        extra={"app_id": app_id, "step": step, "reason": plan.get("reason")},
-                    )
-                    break
+                    # Enforce minimum effort: require at least 4 steps before
+                    # accepting done=true, and only if the page has no visible
+                    # required fields left. This prevents Claude from quitting
+                    # on the first screenshot before it has done anything.
+                    if step < 4:
+                        log.info(
+                            "filler.done_overridden_too_early",
+                            extra={"app_id": app_id, "step": step},
+                        )
+                        plan["done"] = False
+                        plan["actions"] = [{"kind": "scroll", "direction": "down"}]
+                    else:
+                        # Verify there are genuinely no required fields left
+                        unfilled = await page.evaluate(
+                            """
+                            () => {
+                              const fields = document.querySelectorAll(
+                                'input:not([type=hidden]):not([type=submit]), textarea, select'
+                              );
+                              let empty = 0;
+                              for (const f of fields) {
+                                const style = window.getComputedStyle(f);
+                                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                                const required = f.required || f.getAttribute('aria-required') === 'true';
+                                const val = f.value || f.getAttribute('value') || '';
+                                if (required && !val.trim()) empty++;
+                              }
+                              return empty;
+                            }
+                            """
+                        )
+                        if unfilled > 0:
+                            log.info(
+                                "filler.done_overridden_unfilled_required",
+                                extra={"app_id": app_id, "step": step, "unfilled": unfilled},
+                            )
+                            plan["done"] = False
+                            plan["actions"] = [{"kind": "scroll", "direction": "down"}]
+                        else:
+                            log.info(
+                                "filler.agent_done",
+                                extra={"app_id": app_id, "step": step, "reason": plan.get("reason")},
+                            )
+                            break
 
                 actions = plan.get("actions", [])
                 if not actions:
@@ -331,7 +391,7 @@ class UniversalFiller:
                     )
                     await asyncio.sleep(0.5)
 
-                # After each batch, check if we hit an Indeed auth wall mid-form
+                # After each batch, check if we hit an auth wall mid-form
                 mid_check = await self._preflight(page)
                 if mid_check["verdict"] == "indeed_login":
                     log.info(
@@ -342,10 +402,11 @@ class UniversalFiller:
                     auth_ok = await self._handle_indeed_login(page, profile, fill_log)
                     if not auth_ok:
                         log.warning("filler.indeed_login_failed", extra={"app_id": app_id})
-                        break
+                        break  # Exit fill loop — leave as needs_manual
                     shot = await self._screenshot(page, screenshots_dir, len(screenshots))
                     screenshots.append(shot)
 
+                # Wait a moment for page updates
                 await asyncio.sleep(0.3)
 
             # Final screenshot before submit decision
@@ -420,6 +481,11 @@ class UniversalFiller:
         """
         Detect if the current page is a job listing (not a form) and click
         the "Apply" / "I'm Interested" CTA to reach the actual application form.
+
+        Handles:
+          - Same-page navigation (most common — Greenhouse, Lever, Jobvite)
+          - New-tab/window opening (some ATSes)
+          - Greenhouse /apply URL shortcut
         """
         current_url = page.url
         log.info("filler.checking_for_apply_cta", extra={"url": current_url})
@@ -427,6 +493,7 @@ class UniversalFiller:
         # Fast path: URL already looks like a form page
         form_url_signals = ["/apply", "/application", "/job-application", "apply?"]
         if any(sig in current_url.lower() for sig in form_url_signals):
+            # May already be on the form
             form_count = await page.evaluate(
                 "document.querySelectorAll('form, input:not([type=hidden])').length"
             )
@@ -456,7 +523,8 @@ class UniversalFiller:
             if found_page is not None:
                 await asyncio.sleep(1.0)
 
-                # Check if CTA click landed on a login/auth wall
+                # Check if CTA click landed on a login wall — bail out immediately
+                # instead of trying to click more things
                 landed_url = found_page.url.lower()
                 login_url_signals = (
                     "accounts.google.com",
@@ -470,6 +538,9 @@ class UniversalFiller:
                     "login.indeed.com",
                     "/sso/",
                     "/oauth/",
+                    "/signin",
+                    "/sign-in",
+                    "/login",
                 )
                 if any(sig in landed_url for sig in login_url_signals):
                     log.warning(
@@ -478,13 +549,14 @@ class UniversalFiller:
                     )
                     fill_log.append({
                         "step": "navigate",
-                        "action": f"cta '{cta_text}' led to auth page",
+                        "action": f"cta '{cta_text}' led to login/auth page",
                         "url": found_page.url,
                     })
-                    # Return so preflight in fill() classifies and handles it
+                    # Return the page — fill() preflight will classify and
+                    # dispatch to the appropriate handler (Indeed OTP or hard skip)
                     return found_page
 
-                # Take screenshot of the form page
+                # Take screenshot of resulting page
                 shot = await self._screenshot(found_page, screenshots_dir, len(screenshots))
                 screenshots.append(shot)
                 log.info(
@@ -504,6 +576,7 @@ class UniversalFiller:
             except Exception:  # noqa: BLE001
                 pass
 
+        # No CTA found — already on form or no apply button
         log.warning(
             "filler.no_apply_cta_found",
             extra={"url": current_url, "visible_fields": form_elements},
@@ -520,8 +593,11 @@ class UniversalFiller:
     ) -> Any | None:
         """
         Try to find and click a CTA button/link with the given text.
-        Returns the page with the form (may be a new tab), or None if not found.
+
+        Returns the page that has the form (may be a new tab), or None if
+        the CTA was not found.
         """
+        # Try button first, then link, then any clickable element
         locator_fns = [
             lambda p, t: p.get_by_role("button", name=t, exact=False),
             lambda p, t: p.get_by_role("link", name=t, exact=False),
@@ -543,7 +619,9 @@ class UniversalFiller:
                 log.info("filler.clicking_cta", extra={"text": cta_text})
                 url_before = page.url
 
-                # Set up new-page listener BEFORE clicking (avoids race condition)
+                # Set up new-page listener BEFORE clicking (avoids race condition),
+                # then click and check for new tab vs same-page navigation.
+                new_page: Any = None
                 try:
                     async with context.expect_page(timeout=3000) as page_info:
                         await el.click()
@@ -555,23 +633,31 @@ class UniversalFiller:
                     )
                     return new_page
                 except Exception as click_exc:
-                    # Distinguish failed click vs same-page navigation
+                    # Two possibilities:
+                    # A) The click itself failed → re-raise to outer loop so we try next locator
+                    # B) Timeout waiting for new tab → same-page navigation
+                    # Distinguish by checking if the URL changed or form appeared
                     url_after = page.url
                     form_after = await page.evaluate(
                         "() => document.querySelectorAll('input:not([type=hidden]):not([type=submit]), textarea').length"
                     )
                     if url_after == url_before and form_after < 2:
-                        raise  # Click likely failed — try next locator
+                        # Click likely failed — re-raise so outer loop tries next locator
+                        raise
 
-                    # Same-page navigation: poll for URL change then wait for idle
-                    for _ in range(10):
-                        await asyncio.sleep(0.5)
-                        if page.url != url_before:
-                            break
+                    # Same-page navigation happened — wait for it to settle
+                    try:
+                        # Poll for URL change (up to 5 seconds)
+                        for _ in range(10):
+                            await asyncio.sleep(0.5)
+                            if page.url != url_before:
+                                break
+                    except Exception:  # noqa: BLE001
+                        pass
                     try:
                         await page.wait_for_load_state("networkidle", timeout=10_000)
                     except Exception:  # noqa: BLE001
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(2.0)  # fallback wait
                     fill_log.append(
                         {
                             "step": "navigate",
@@ -591,6 +677,7 @@ class UniversalFiller:
 
     async def _ensure_browser(self) -> None:
         if self._browser is not None:
+            # Check browser is still alive
             try:
                 _ = self._browser.contexts
                 return
@@ -614,16 +701,19 @@ class UniversalFiller:
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                # Suppress Chrome first-run / "Sign in to Chrome" OS dialog
+                # Suppress Chrome first-run / sync dialogs
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-sync",
                 "--disable-features=ChromeWhatsNew,Translate",
                 "--disable-extensions",
+                # Suppress the "Sign in to Chrome" OS-level dialog
                 "--disable-background-networking",
                 "--disable-client-side-phishing-detection",
                 "--disable-default-apps",
                 "--disable-hang-monitor",
+                "--disable-popup-blocking",
+                "--disable-prompt-on-repost",
                 "--metrics-recording-only",
                 "--password-store=basic",
                 "--use-mock-keychain",
@@ -636,19 +726,24 @@ class UniversalFiller:
         )
 
     # ──────────────────────────────────────────────────────────────────────
-    # Preflight — detects login walls, Indeed auth, closed listings
+    # Preflight
     # ──────────────────────────────────────────────────────────────────────
 
     async def _preflight(self, page: Any) -> dict[str, Any]:
         """
-        Returns dict with keys:
-          verdict: "ok" | "indeed_login" | "login_required" | "closed" | "unsupported"
-          reason:  human-readable string
+        Check for blockers before filling the form:
+          - Login/auth walls (Google SSO, Indeed account, LinkedIn login, etc.)
+          - Closed/inactive listings
+          - Non-job pages (404, error pages)
+
+        Returns a dict with keys:
+          verdict: "ok" | "closed" | "login_required" | "unsupported"
+          reason:  human-readable reason string
         """
         current_url = page.url.lower()
 
-        # ── Indeed auth page (URL-level) — handle with OTP, not a hard skip
-        indeed_auth_url_signals = (
+        # ── Indeed auth page — handle with email OTP (not a hard skip) ──────
+        indeed_auth_signals = (
             "indeed.com/account",
             "indeed.com/auth",
             "secure.indeed.com",
@@ -657,21 +752,32 @@ class UniversalFiller:
             "indeed.com/signin",
             "indeed.com/login",
         )
-        if any(sig in current_url for sig in indeed_auth_url_signals):
-            return {"verdict": "indeed_login", "reason": "indeed_auth_url"}
+        if any(sig in current_url for sig in indeed_auth_signals):
+            return {"verdict": "indeed_login", "reason": "indeed_auth_page"}
 
-        # ── Other hard login walls (URL-level) — skip
-        hard_auth_url_signals = (
+        # ── Other hard login walls (non-Indeed) — skip ─────────────────────
+        auth_url_signals = (
             "accounts.google.com",
             "login.microsoftonline.com",
             "linkedin.com/login",
             "linkedin.com/checkpoint",
+            "linkedin.com/signup",
+            "linkedin.com/join",          # LinkedIn creates an account page
+            "linkedin.com/authwall",      # LinkedIn auth wall redirect
+            "linkedin.com/uas/login",     # Legacy LinkedIn login URL
             "smartrecruiters.com/candidate/login",
+            "workday.com/login",
+            "okta.com/login",
+            "auth0.com",
         )
-        if any(sig in current_url for sig in hard_auth_url_signals):
+        if any(sig in current_url for sig in auth_url_signals):
             return {
                 "verdict": "login_required",
-                "reason": f"Login wall at {page.url}. Use a direct company board link instead.",
+                "reason": (
+                    f"Page redirected to a login wall: {page.url}. "
+                    "This job requires account authentication before applying. "
+                    "Try finding a direct application link (Greenhouse/Lever board) instead."
+                ),
             }
 
         try:
@@ -681,32 +787,44 @@ class UniversalFiller:
         except Exception:  # noqa: BLE001
             body_text = ""
 
-        # ── Indeed auth page (content-level)
+        # ── Indeed account page detected via content ──────────────────────
         indeed_content_signals = (
             "create an indeed account",
             "sign in to indeed",
             "ready to take the next step",
+            "continue with google",   # indeed's "or" separator with google login
         )
+        # Only flag as indeed_login if indeed.com is somewhere in the URL OR
+        # the page has the Indeed logo/brand (most reliable is URL check above,
+        # but some ATSes open Indeed in an iframe)
         if any(sig in body_text for sig in indeed_content_signals) and "indeed" in current_url:
-            return {"verdict": "indeed_login", "reason": "indeed_auth_page_content"}
+            return {"verdict": "indeed_login", "reason": "indeed_account_page_content"}
 
-        # ── Other login walls (content-level)
-        login_content_signals = (
+        # ── Other login wall detection (page content) ─────────────────────
+        login_signals = (
             "sign in with google",
             "sign in with linkedin",
+            "sign in with facebook",
+            "sign in with apple",
             "sign in to continue",
             "log in to continue",
+            "continue with linkedin",
             "sign in to apply",
             "log in to apply",
             "you must be logged in",
+            "please sign in",
         )
-        if any(sig in body_text for sig in login_content_signals):
+        if any(sig in body_text for sig in login_signals):
             return {
                 "verdict": "login_required",
-                "reason": f"Login wall content at {page.url}.",
+                "reason": (
+                    f"Application requires login at {page.url}. "
+                    "This job uses a platform (LinkedIn/Google) that requires "
+                    "an existing account to apply. Try a direct company board link instead."
+                ),
             }
 
-        # ── Closed listings
+        # ── Closed listing detection ───────────────────────────────────────
         closed_signals = (
             "no longer accepting",
             "position has been filled",
@@ -715,283 +833,12 @@ class UniversalFiller:
             "applications are closed",
             "job is closed",
             "this job has expired",
+            "listing has been removed",
         )
         if any(sig in body_text for sig in closed_signals):
             return {"verdict": "closed", "reason": "posting_closed"}
 
         return {"verdict": "ok", "reason": "proceed"}
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Indeed email + OTP authentication
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def _handle_indeed_login(
-        self,
-        page: Any,
-        profile: Any,
-        fill_log: list,
-    ) -> bool:
-        """
-        Handle Indeed's "Create an account or sign in" page.
-
-        1. Enter the candidate's email → click Continue.
-        2. Poll Outlook IMAP for the OTP verification email (up to 4 minutes).
-        3. Enter the OTP code → click Continue.
-        Returns True if auth succeeded, False otherwise.
-        """
-        email = getattr(getattr(profile, "profile", profile), "email", None)
-        if not email:
-            log.warning("filler.indeed_login.no_email")
-            return False
-
-        log.info("filler.indeed_login.entering_email", extra={"email": email})
-
-        # ── Step 1: Fill email and click Continue ─────────────────────────
-        try:
-            email_locators = [
-                page.get_by_label("Email address", exact=False),
-                page.locator("input[type='email']"),
-                page.locator("input[name*='email']"),
-                page.locator("input[id*='email']"),
-            ]
-            email_input = None
-            for loc in email_locators:
-                try:
-                    if await loc.count() and await loc.first.is_visible():
-                        email_input = loc.first
-                        break
-                except Exception:  # noqa: BLE001
-                    continue
-
-            if email_input is None:
-                log.warning("filler.indeed_login.email_input_not_found")
-                return False
-
-            await email_input.fill(email)
-            await asyncio.sleep(0.5)
-
-            for btn_text in ("Continue", "Sign in", "Next", "Log in"):
-                btn = await self._find_button(page, btn_text)
-                if btn is not None and await btn.is_visible():
-                    await btn.click()
-                    fill_log.append({"step": "indeed_login", "action": f"clicked_{btn_text}"})
-                    break
-
-            # Wait for Indeed to process and load the OTP page
-            await asyncio.sleep(2.0)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8_000)
-            except Exception:  # noqa: BLE001
-                await asyncio.sleep(3.0)
-
-        except Exception as exc:  # noqa: BLE001
-            log.warning("filler.indeed_login.email_step_failed", extra={"error": str(exc)})
-            return False
-
-        # ── Step 2: Detect OTP input — poll for up to 15 seconds ─────────
-        otp_input = None
-        for _attempt in range(6):  # 6 × 2.5s = 15s max
-            otp_locators = [
-                page.locator("input[autocomplete='one-time-code']"),
-                page.get_by_label("Verification code", exact=False),
-                page.get_by_label("Enter the code", exact=False),
-                page.get_by_label("Enter code", exact=False),
-                page.get_by_placeholder("Enter code"),
-                page.get_by_placeholder("6-digit code"),
-                page.locator("input[name='code']"),
-                page.locator("input[id*='verification']"),
-                page.locator("input[id*='code']"),
-                page.locator("input[data-testid*='code']"),
-            ]
-            for loc in otp_locators:
-                try:
-                    if await loc.count() and await loc.first.is_visible():
-                        otp_input = loc.first
-                        break
-                except Exception:  # noqa: BLE001
-                    continue
-            if otp_input is not None:
-                break
-            await asyncio.sleep(2.5)
-
-        if otp_input is None:
-            # Check if login succeeded without OTP (existing session)
-            body = await page.evaluate(
-                "document.body ? document.body.innerText.toLowerCase() : ''"
-            )
-            url_now = page.url.lower()
-            still_on_auth = any(
-                sig in url_now or sig in body
-                for sig in ("sign in", "verify", "create an account", "indeed.com/account")
-            )
-            if not still_on_auth:
-                log.info("filler.indeed_login.no_otp_needed")
-                fill_log.append({"step": "indeed_login", "action": "no_otp_required"})
-                return True
-            log.warning(
-                "filler.indeed_login.otp_input_not_found",
-                extra={"url": page.url, "body_snippet": body[:200]},
-            )
-            return False
-
-        log.info("filler.indeed_login.otp_field_found_polling_email")
-        fill_log.append({"step": "indeed_login", "action": "otp_field_detected_polling_email"})
-
-        # ── Step 3: Wait then poll inbox for OTP email ────────────────────
-        # Indeed can take 30–120 seconds to send the email.
-        # Wait 20s before first IMAP check, then poll for up to ~3.5 more minutes.
-        log.info("filler.indeed_login.waiting_20s_for_email_delivery")
-        await asyncio.sleep(20.0)
-
-        otp_code = await self._fetch_otp_from_email(
-            sender_hint="indeed",
-            subject_hint="verification",
-            timeout_seconds=220,  # 20s already waited → total ~4 min
-        )
-
-        if not otp_code:
-            log.warning("filler.indeed_login.otp_not_found_in_email")
-            fill_log.append({"step": "indeed_login", "action": "otp_not_found"})
-            return False
-
-        log.info("filler.indeed_login.otp_found", extra={"code": otp_code})
-        fill_log.append({"step": "indeed_login", "action": "otp_found", "code": otp_code})
-
-        # ── Step 4: Enter OTP and continue ───────────────────────────────
-        try:
-            await otp_input.fill(otp_code)
-            await asyncio.sleep(0.5)
-            for btn_text in ("Continue", "Verify", "Sign in", "Submit", "Next"):
-                btn = await self._find_button(page, btn_text)
-                if btn is not None and await btn.is_visible():
-                    await btn.click()
-                    fill_log.append({"step": "indeed_login", "action": f"submitted_otp_{btn_text}"})
-                    break
-            await asyncio.sleep(3.0)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log.warning("filler.indeed_login.otp_entry_failed", extra={"error": str(exc)})
-            return False
-
-    async def _fetch_otp_from_email(
-        self,
-        sender_hint: str = "indeed",
-        subject_hint: str = "verification",
-        timeout_seconds: int = 220,
-    ) -> str | None:
-        """
-        Poll the configured Outlook IMAP inbox for an OTP/verification-code email.
-        Polls every 10 seconds for up to timeout_seconds.
-        Returns the code string (4-8 digits), or None if not found.
-        """
-        if not settings.email_configured:
-            log.warning(
-                "filler.otp_email.not_configured",
-                extra={"hint": "Set OUTLOOK_EMAIL and OUTLOOK_APP_PASSWORD in .env"},
-            )
-            return None
-
-        loop = asyncio.get_event_loop()
-
-        def _imap_search() -> str | None:
-            """Blocking IMAP call — runs in thread executor."""
-            try:
-                import imapclient  # type: ignore[import-untyped]
-                import email as _email_lib
-                import datetime
-                import re as _re
-                import html as _html_mod
-
-                def _decode(val: bytes | str) -> str:
-                    if isinstance(val, bytes):
-                        return val.decode("utf-8", errors="replace")
-                    return val
-
-                with imapclient.IMAPClient(
-                    settings.imap_host, port=settings.imap_port, ssl=True
-                ) as server:
-                    server.login(settings.outlook_email, settings.outlook_app_password)
-                    server.select_folder("INBOX")
-
-                    today_str = datetime.datetime.utcnow().strftime("%d-%b-%Y")
-
-                    # Try unseen first, then all of today
-                    uids: list[int] = []
-                    for criteria in (
-                        ["SINCE", today_str, "UNSEEN"],
-                        ["SINCE", today_str],
-                    ):
-                        uids = server.search(criteria)  # type: ignore[assignment]
-                        if uids:
-                            break
-
-                    if not uids:
-                        return None
-
-                    for uid in sorted(uids, reverse=True)[:15]:
-                        try:
-                            data = server.fetch([uid], ["RFC822"])
-                            raw = data[uid].get(b"RFC822", b"")
-                            if not raw:
-                                continue
-                            msg = _email_lib.message_from_bytes(raw)
-                            sender = msg.get("From", "").lower()
-                            subject = msg.get("Subject", "").lower()
-
-                            if sender_hint.lower() not in sender and sender_hint.lower() not in subject:
-                                continue
-
-                            # Extract body text
-                            body = ""
-                            if msg.is_multipart():
-                                for part in msg.walk():
-                                    ct = part.get_content_type()
-                                    if ct == "text/plain":
-                                        body += _decode(part.get_payload(decode=True) or b"")
-                                    elif ct == "text/html" and not body:
-                                        raw_html = _decode(part.get_payload(decode=True) or b"")
-                                        body += _re.sub(r"<[^>]+>", " ", raw_html)
-                            else:
-                                body = _decode(msg.get_payload(decode=True) or b"")
-
-                            # Prefer codes near keywords
-                            code_ctx = _re.findall(
-                                r"(?:code|verify|verification|otp)[^\d]{0,30}(\d{4,8})",
-                                body.lower(),
-                            )
-                            if code_ctx:
-                                return code_ctx[0]
-
-                            # Fallback: first 4-8 digit number in body
-                            all_codes = _re.findall(r"\b(\d{4,8})\b", body)
-                            if all_codes:
-                                return all_codes[0]
-
-                        except Exception:  # noqa: BLE001
-                            continue
-
-            except Exception as exc:  # noqa: BLE001
-                log.warning("filler.otp_imap_error", extra={"error": str(exc)})
-            return None
-
-        deadline = time.monotonic() + timeout_seconds
-        poll_interval = 10  # seconds between IMAP checks
-        attempt = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            log.info(
-                "filler.otp_imap_poll",
-                extra={"attempt": attempt, "remaining_s": int(deadline - time.monotonic())},
-            )
-            code = await loop.run_in_executor(None, _imap_search)
-            if code:
-                return code
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(poll_interval, remaining))
-
-        return None
 
     # ──────────────────────────────────────────────────────────────────────
     # Screenshots + DOM snapshot
@@ -1048,7 +895,11 @@ class UniversalFiller:
                     });
                     if (out.length >= 80) break;
                   }
-                  return { url: location.href, title: document.title, elements: out };
+                  return {
+                    url: location.href,
+                    title: document.title,
+                    elements: out,
+                  };
                 }
                 """
             )
@@ -1070,9 +921,11 @@ class UniversalFiller:
         job_description: str,
         fill_log: list[dict[str, Any]],
         submit: bool,
+        step_number: int = 0,
     ) -> dict[str, Any]:
         user_content: list[dict[str, Any]] = []
 
+        # Attach screenshot
         try:
             img_b64 = base64.b64encode(Path(screenshot_path).read_bytes()).decode("ascii")
             user_content.append(
@@ -1122,23 +975,36 @@ VISIBLE INTERACTIVE ELEMENTS
 {elements_json}
 
 ═══════════════════════════════════
-INSTRUCTIONS
+INSTRUCTIONS  [step {step_number} of up to {self.max_steps}]
 ═══════════════════════════════════
 You are filling a job application form on behalf of the candidate.
 Shadow mode: {not submit}  (if true → NEVER produce a click action for the final Submit/Apply button)
 
-For EACH visible, unfilled required field produce an action.
-For optional fields: fill them if you have the data; skip if not.
-For EEO/demographic questions: use "Prefer not to say" unless the profile explicitly sets a value.
-For "How did you hear about us?": answer "Company website".
-For custom essay questions: write 2-4 specific, honest sentences using profile + job description.
-If a "Next" / "Continue" / "Save and Continue" button is visible AND unfilled required fields remain on this page: fill them first, then click Next.
-If the page shows a review/confirm screen with all fields visible: set done=true.
-If the page shows a success/confirmation message: set done=true.
+YOUR CORE JOB: Be thorough. Fill every field. Scroll. Navigate every page.
+Do not stop early. The most common failure mode is stopping after one page
+when there are two or three more pages to fill.
+
+FILLING RULES:
+- For EACH visible, unfilled required field: produce a fill/select/check action.
+- For optional fields: fill them if you have the data; skip only if truly no data.
+- For EEO/demographic questions: use "Prefer not to say" unless the profile sets a value.
+- For "How did you hear about us?": answer "Company website".
+- For custom essay questions: write 2-4 specific, honest sentences using profile + job context.
+- After filling all fields on a page, if a "Next" / "Continue" / "Save and Continue" button
+  exists: click it. There are almost always more pages.
+- If the page appears blank or partially loaded: produce a scroll action — never stop.
+- If you cannot find a field by label, try scrolling down to reveal it before giving up.
+
+STOPPING RULE — only set done=true when ALL four are true:
+  1. You have scrolled to the very bottom of the current page.
+  2. You have filled every visible required field.
+  3. The final submit button is now visible on screen (shadow mode: you see it but do not click it).
+  4. You have completed at least {max(4, step_number)} steps already.
+If ANY condition is not met, set done=false and continue. When uncertain, scroll down.
 
 Return a single JSON object — no prose, no markdown fences:
 {{
-  "summary": "<one sentence what you are doing>",
+  "summary": "<one sentence what you are doing this step>",
   "done": false,
   "reason": null,
   "actions": [
@@ -1209,15 +1075,17 @@ Return a single JSON object — no prose, no markdown fences:
 
             if kind == "upload":
                 path = str(action.get("path") or resume_path)
+                # Prefer explicit file inputs
                 el = await self._find_field(page, label, kinds=("input",), input_type="file")
                 if el is None:
+                    # Fallback: any visible file input
                     loc = page.locator("input[type='file']")
                     if await loc.count():
                         el = loc.first
                 if el is None:
                     return f"upload_field_not_found: {label}"
                 await el.set_input_files(path)
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.5)  # let upload UI settle
                 return f"uploaded: {Path(path).name}"
 
             if kind == "click":
@@ -1225,7 +1093,7 @@ Return a single JSON object — no prose, no markdown fences:
                 if btn is None:
                     return f"button_not_found: {label}"
                 await btn.click()
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.5)  # wait for page change after Next/Continue
                 return f"clicked: {label}"
 
             if kind == "answer_custom":
@@ -1271,6 +1139,7 @@ Return a single JSON object — no prose, no markdown fences:
         if not label_clean:
             return None
 
+        # 1. get_by_label (handles <label for=…>)
         try:
             loc = page.get_by_label(label_clean, exact=False)
             if await loc.count():
@@ -1280,6 +1149,7 @@ Return a single JSON object — no prose, no markdown fences:
         except Exception:  # noqa: BLE001
             pass
 
+        # 2. placeholder
         try:
             loc = page.get_by_placeholder(label_clean, exact=False)
             if await loc.count():
@@ -1289,6 +1159,7 @@ Return a single JSON object — no prose, no markdown fences:
         except Exception:  # noqa: BLE001
             pass
 
+        # 3. aria-label contains
         for kind in kinds:
             type_suffix = f"[type='{input_type}']" if input_type and kind == "input" else ""
             selectors = [
@@ -1307,6 +1178,7 @@ Return a single JSON object — no prose, no markdown fences:
                 except Exception:  # noqa: BLE001
                     continue
 
+        # 4. Any visible file input (when input_type='file')
         if input_type == "file":
             try:
                 loc = page.locator("input[type='file']")
@@ -1318,6 +1190,8 @@ Return a single JSON object — no prose, no markdown fences:
         return None
 
     async def _handle_select(self, page: Any, label: str, value: str) -> str:
+        """Handle both native <select> and custom dropdowns."""
+        # Try native select first
         el = await self._find_field(page, label, kinds=("select",))
         if el is not None:
             try:
@@ -1330,6 +1204,7 @@ Return a single JSON object — no prose, no markdown fences:
                 except Exception:  # noqa: BLE001
                     pass
 
+        # Custom combobox / react-select style
         combo = await self._find_field(page, label, kinds=("input", "button"))
         if combo is not None:
             await combo.click()
@@ -1341,6 +1216,7 @@ Return a single JSON object — no prose, no markdown fences:
                     return f"selected_combobox: {value}"
             except Exception:  # noqa: BLE001
                 pass
+            # Type and press Enter
             try:
                 await combo.fill(value)
                 await asyncio.sleep(0.3)
@@ -1372,6 +1248,275 @@ Return a single JSON object — no prose, no markdown fences:
         return None
 
     # ──────────────────────────────────────────────────────────────────────
+    # Indeed email + OTP authentication
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _handle_indeed_login(
+        self,
+        page: Any,
+        profile: Any,
+        fill_log: list,
+    ) -> bool:
+        """
+        Handle Indeed's "Create an account or sign in" page.
+
+        Flow:
+          1. Enter the candidate's email → click Continue
+          2. If an OTP/verification-code input appears, fetch the code from
+             the configured Outlook inbox and enter it → click Continue
+          3. Return True if we successfully passed auth, False otherwise.
+        """
+        email = getattr(getattr(profile, "profile", profile), "email", None)
+        if not email:
+            log.warning("filler.indeed_login.no_email")
+            return False
+
+        log.info("filler.indeed_login.entering_email", extra={"email": email})
+
+        # ── Step 1: Fill email field ──────────────────────────────────────
+        try:
+            email_input = page.get_by_label("Email address", exact=False)
+            if not await email_input.count():
+                email_input = page.locator("input[type='email'], input[name*='email'], input[id*='email']")
+            if not await email_input.count():
+                log.warning("filler.indeed_login.email_input_not_found")
+                return False
+
+            await email_input.first.fill(email)
+            await asyncio.sleep(0.5)
+
+            # Click Continue / Next / Sign in
+            for btn_text in ("Continue", "Sign in", "Next", "Log in"):
+                btn = await self._find_button(page, btn_text)
+                if btn is not None and await btn.is_visible():
+                    await btn.click()
+                    fill_log.append({"step": "indeed_login", "action": f"clicked {btn_text}"})
+                    break
+
+            # Wait for Indeed to process the email and load the OTP page
+            await asyncio.sleep(2.0)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:  # noqa: BLE001
+                await asyncio.sleep(3.0)
+
+        except Exception as exc:  # noqa: BLE001
+            log.warning("filler.indeed_login.email_step_failed", extra={"error": str(exc)})
+            return False
+
+        # ── Step 2: Detect OTP / verification code field ─────────────────
+        # Indeed's OTP page HTML uses several possible field labels/attributes.
+        # Poll for up to 15 seconds — the OTP page loads after a network round-trip.
+        otp_input = None
+        for _attempt in range(6):  # 6 × 2.5s = 15s max
+            otp_locators = [
+                page.locator("input[autocomplete='one-time-code']"),
+                page.get_by_label("Verification code", exact=False),
+                page.get_by_label("Enter the code", exact=False),
+                page.get_by_label("Enter code", exact=False),
+                page.get_by_placeholder("Enter code"),
+                page.get_by_placeholder("6-digit code"),
+                page.locator("input[name='code']"),
+                page.locator("input[id*='verification']"),
+                page.locator("input[id*='code']"),
+                page.locator("input[data-testid*='code']"),
+                # Generic: any single-line input on a page that mentions "code"
+            ]
+            for loc in otp_locators:
+                try:
+                    if await loc.count() and await loc.first.is_visible():
+                        otp_input = loc.first
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if otp_input is not None:
+                break
+            await asyncio.sleep(2.5)
+
+        if otp_input is None:
+            # Check if login succeeded without OTP (existing session)
+            body = await page.evaluate(
+                "document.body ? document.body.innerText.toLowerCase() : ''"
+            )
+            url_now = page.url.lower()
+            auth_still_present = any(
+                sig in url_now or sig in body
+                for sig in ("sign in", "verify", "create an account", "indeed.com/account")
+            )
+            if not auth_still_present:
+                log.info("filler.indeed_login.no_otp_needed")
+                fill_log.append({"step": "indeed_login", "action": "no_otp_required"})
+                return True
+            log.warning(
+                "filler.indeed_login.otp_input_not_found",
+                extra={"url": page.url, "body_snippet": body[:200]},
+            )
+            return False
+
+        log.info("filler.indeed_login.waiting_for_otp_email")
+        fill_log.append({"step": "indeed_login", "action": "otp_field_detected_polling_email"})
+
+        # ── Step 3: Fetch OTP from email inbox ────────────────────────────
+        otp_code = await self._fetch_otp_from_email(
+            sender_hint="indeed",
+            subject_hint="verification",
+            timeout_seconds=90,
+        )
+
+        if not otp_code:
+            log.warning("filler.indeed_login.otp_not_found_in_email")
+            fill_log.append({"step": "indeed_login", "action": "otp_not_found_in_email"})
+            return False
+
+        log.info("filler.indeed_login.otp_found", extra={"code": otp_code})
+        fill_log.append({"step": "indeed_login", "action": "otp_found", "code": otp_code})
+
+        # ── Step 4: Enter OTP ─────────────────────────────────────────────
+        try:
+            await otp_input.fill(otp_code)
+            await asyncio.sleep(0.5)
+            for btn_text in ("Continue", "Verify", "Sign in", "Submit", "Next"):
+                btn = await self._find_button(page, btn_text)
+                if btn is not None and await btn.is_visible():
+                    await btn.click()
+                    fill_log.append({"step": "indeed_login", "action": f"submitted_otp_{btn_text}"})
+                    break
+            await asyncio.sleep(3.0)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("filler.indeed_login.otp_entry_failed", extra={"error": str(exc)})
+            return False
+
+    async def _fetch_otp_from_email(
+        self,
+        sender_hint: str = "indeed",
+        subject_hint: str = "verification",
+        timeout_seconds: int = 90,
+    ) -> str | None:
+        """
+        Poll the configured Outlook IMAP inbox for an OTP / verification-code email.
+
+        Looks for a recent email whose sender/subject matches the hints, then
+        extracts the first 4-8 digit number from the body.
+
+        Returns the code string, or None if not found within timeout_seconds.
+        """
+        if not settings.email_configured:
+            log.warning(
+                "filler.otp_email.not_configured",
+                extra={"hint": "Set OUTLOOK_EMAIL and OUTLOOK_APP_PASSWORD in .env"},
+            )
+            return None
+
+        import re as _re
+
+        loop = asyncio.get_event_loop()
+
+        def _imap_search() -> str | None:
+            """Blocking IMAP call — runs in a thread executor."""
+            try:
+                import imapclient  # type: ignore[import-untyped]
+                import email as _email_lib
+                import datetime
+
+                def _decode(val: bytes | str) -> str:
+                    if isinstance(val, bytes):
+                        return val.decode("utf-8", errors="replace")
+                    return val
+
+                with imapclient.IMAPClient(
+                    settings.imap_host, port=settings.imap_port, ssl=True
+                ) as server:
+                    server.login(settings.outlook_email, settings.outlook_app_password)
+                    server.select_folder("INBOX")
+
+                    # Search emails from today — IMAP SINCE only has day granularity
+                    today_str = datetime.datetime.utcnow().strftime("%d-%b-%Y")
+
+                    # Try unseen first (most likely), fall back to all today
+                    for criteria in (
+                        ["SINCE", today_str, "UNSEEN"],
+                        ["SINCE", today_str],
+                    ):
+                        uids = server.search(criteria)
+                        if uids:
+                            break
+
+                    if not uids:
+                        return None
+
+                    # Sort newest first, check up to 15 most recent emails
+                    for uid in sorted(uids, reverse=True)[:15]:
+                        try:
+                            data = server.fetch([uid], ["RFC822"])
+                            raw = data[uid].get(b"RFC822", b"")
+                            if not raw:
+                                continue
+                            msg = _email_lib.message_from_bytes(raw)
+                            sender = msg.get("From", "").lower()
+                            subject = msg.get("Subject", "").lower()
+
+                            # Must match sender OR subject hint
+                            hint_lower = sender_hint.lower()
+                            subj_hint = subject_hint.lower()
+                            if hint_lower not in sender and hint_lower not in subject:
+                                continue
+                            if subj_hint and subj_hint not in subject and subj_hint not in sender:
+                                # Also check if the body mentions it
+                                pass  # will check body below
+
+                            # Extract plain text body
+                            body = ""
+                            if msg.is_multipart():
+                                for part in msg.walk():
+                                    ct = part.get_content_type()
+                                    if ct == "text/plain":
+                                        body += _decode(part.get_payload(decode=True) or b"")
+                                    elif ct == "text/html" and not body:
+                                        # Fallback to HTML if no plain text
+                                        import html as _html_mod
+                                        raw_html = _decode(part.get_payload(decode=True) or b"")
+                                        # Strip tags crudely
+                                        body += _re.sub(r"<[^>]+>", " ", raw_html)
+                            else:
+                                body = _decode(msg.get_payload(decode=True) or b"")
+
+                            # Look for standalone 4-8 digit OTP code
+                            # Prefer codes that appear near keywords like "code", "verify"
+                            code_context = _re.findall(
+                                r"(?:code|verify|verification|otp)[^\d]{0,30}(\d{4,8})",
+                                body.lower(),
+                            )
+                            if code_context:
+                                return code_context[0]
+
+                            # Fallback: any 4-8 digit number in the body
+                            all_codes = _re.findall(r"\b(\d{4,8})\b", body)
+                            if all_codes:
+                                return all_codes[0]
+
+                        except Exception:  # noqa: BLE001
+                            continue
+
+            except Exception as exc:  # noqa: BLE001
+                log.warning("filler.otp_imap_error", extra={"error": str(exc)})
+            return None
+
+        # Poll for up to timeout_seconds
+        deadline = time.monotonic() + timeout_seconds
+        poll_interval = 5  # seconds between IMAP checks
+        while time.monotonic() < deadline:
+            code = await loop.run_in_executor(None, _imap_search)
+            if code:
+                return code
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
+
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────
     # Final submit (live mode)
     # ──────────────────────────────────────────────────────────────────────
 
@@ -1397,6 +1542,7 @@ Return a single JSON object — no prose, no markdown fences:
                 )
                 if any(p in body for p in success_phrases):
                     return True, None
+                # Clicked but no confirmation text — still treat as submitted
                 return True, "clicked_submit_no_confirmation"
             except Exception as exc:  # noqa: BLE001
                 return False, str(exc)

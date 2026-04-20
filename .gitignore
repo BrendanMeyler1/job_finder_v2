@@ -1,14 +1,11 @@
-# Secrets
-.env
-
-# Claude Code local state
-.claude/
-
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.egg-info/
 dist/
 build/
@@ -16,19 +13,29 @@ build/
 venv/
 env/
 
-# Node
-node_modules/
-
-# Data / DB
+# Data / secrets
+.env
 data/
 *.db
-*.sqlite3
-data/encryption.key
+*.db-shm
+*.db-wal
 
-# Logs
-*.log
-logs/
+# Node
+node_modules/
+dashboard/dist/
+dashboard/.vite/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings (machine-specific permissions)
+.claude/
+
+# pytest temp files
+tests/.tmp/
